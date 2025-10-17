@@ -1,0 +1,285 @@
+# ==========================================================
+# GitHub Copilot Project Specification
+# Project: VumaBrew (vuma-brew)
+# ==========================================================
+
+name: vuma-brew
+summary: |
+  ☕ VumaBrew — Brew it locally. Serve it globally.
+  A self-hosted Git-push deployment platform for Node.js and Vite apps.
+description: |
+  VumaBrew Core lets you deploy Node.js or Vite apps to your own Ubuntu server
+  using a simple Git-push workflow. Each app runs under its own subdomain
+  (e.g. app.apps.domain.com), managed by Nginx with SSL and PM2. 
+  The system includes setup scripts, a deploy CLI for local machines, 
+  and clean .env-based configuration for both server and client installs.
+
+goals:
+  - Let users deploy apps via Git push without CI/CD pipelines
+  - Manage app subdomains and SSL automatically
+  - Track app-to-port mappings in JSON
+  - Provide client/server install scripts with .env configuration
+  - Focus on a lightweight, dogfoodable MVP for self-use
+
+environment:
+  os: ubuntu-22.04
+  packages:
+    - git
+    - nodejs
+    - npm
+    - nginx
+    - jq
+    - pm2
+    - certbot
+    - python3-certbot-nginx
+    - cron
+  users:
+    - name: deploy
+      description: Non-root user for Git-push deploys
+
+directories:
+  - /var/repos
+  - /var/www
+  - /var/deploy-utils
+
+files:
+
+  # --------------------------------------------------------
+  # 1. Server Environment Configuration
+  # --------------------------------------------------------
+  - path: /var/deploy-utils/.env
+    purpose: Environment configuration for the server
+    content: |
+      BASE_DOMAIN="apps.domain.com"
+      ADMIN_EMAIL="admin@domain.com"
+      USE_WILDCARD_SSL=true
+      CERTBOT_EMAIL="admin@domain.com"
+      DEFAULT_NODE_PORT=4173
+      DEPLOY_USER="deploy"
+      DEPLOY_HOME="/home/deploy"
+
+  # --------------------------------------------------------
+  # 2. Client Environment Configuration
+  # --------------------------------------------------------
+  - path: ~/.deploy.env
+    purpose: Local environment configuration for developers
+    content: |
+      DEPLOY_SERVER_USER="deploy"
+      DEPLOY_SERVER_HOST="your-server"
+      DEPLOY_SERVER="${DEPLOY_SERVER_USER}@${DEPLOY_SERVER_HOST}"
+      DEPLOY_UTILS_PATH="/var/deploy-utils"
+
+  # --------------------------------------------------------
+  # 3. Server Setup Script
+  # --------------------------------------------------------
+  - path: /var/deploy-utils/setup-server.sh
+    executable: true
+    purpose: Install dependencies, configure PM2, SSL, and directory layout
+    content: |
+      #!/bin/bash
+      set -e
+      [ -f /var/deploy-utils/.env ] && set -o allexport && source /var/deploy-utils/.env && set +o allexport
+      apt update && apt install -y git nodejs npm nginx jq pm2 cron certbot python3-certbot-nginx
+      adduser --disabled-password --gecos "" $DEPLOY_USER || true
+      usermod -aG sudo $DEPLOY_USER
+      mkdir -p /var/{repos,www,deploy-utils}
+      [ ! -f /var/deploy-utils/ports.json ] && echo "{}" > /var/deploy-utils/ports.json
+      chown -R $DEPLOY_USER:$DEPLOY_USER /var/{repos,www,deploy-utils}
+      su - $DEPLOY_USER -c "pm2 startup systemd -u $DEPLOY_USER --hp $DEPLOY_HOME"
+      su - $DEPLOY_USER -c "pm2 save"
+      (crontab -l 2>/dev/null; echo '0 * * * * /usr/bin/pm2 save > /dev/null 2>&1') | crontab -
+      systemctl enable nginx
+      systemctl restart nginx
+      echo "✅ VumaBrew server setup complete."
+
+  # --------------------------------------------------------
+  # 4. Create App Script
+  # --------------------------------------------------------
+  - path: /var/deploy-utils/create-app.sh
+    executable: true
+    purpose: Create a new app repo, assign a port, and output JSON info
+    content: |
+      #!/bin/bash
+      set -e
+      [ -f /var/deploy-utils/.env ] && set -o allexport && source /var/deploy-utils/.env && set +o allexport
+      PORT_FILE="/var/deploy-utils/ports.json"
+      APP_NAME=$1
+      ADJECTIVES=(brave calm bright cozy swift lucky fresh quiet clever)
+      ANIMALS=(otter fox crane dolphin panda wolf sparrow bear owl)
+      if [ -z "$APP_NAME" ]; then
+        A=${ADJECTIVES[$RANDOM % ${#ADJECTIVES[@]}]}
+        B=${ANIMALS[$RANDOM % ${#ANIMALS[@]}]}
+        APP_NAME="${A}-${B}"
+      fi
+      DOMAIN="${APP_NAME}.${BASE_DOMAIN}"
+      [ ! -f "$PORT_FILE" ] && echo "{}" > "$PORT_FILE"
+      LAST_PORT=$(jq -r 'values | max // 4173' "$PORT_FILE")
+      NEW_PORT=$((LAST_PORT + 1))
+      jq --arg app "$APP_NAME" --argjson port $NEW_PORT '. + {($app): $port}' "$PORT_FILE" > tmp.$$.json && mv tmp.$$.json "$PORT_FILE"
+      REPO_PATH="/var/repos/${APP_NAME}.git"
+      mkdir -p "$REPO_PATH"
+      cd "$REPO_PATH" && git init --bare
+      cat <<HOOK > hooks/post-receive
+      #!/bin/bash
+      /var/deploy-utils/deploy-hook.sh $APP_NAME $DOMAIN $NEW_PORT
+      HOOK
+      chmod +x hooks/post-receive
+      jq -n --arg name "$APP_NAME" --arg domain "$DOMAIN" --arg port "$NEW_PORT" --arg repo "$REPO_PATH" \
+        '{name:$name,domain:$domain,port:$port,repo:$repo}'
+
+  # --------------------------------------------------------
+  # 5. Deploy Hook Script
+  # --------------------------------------------------------
+  - path: /var/deploy-utils/deploy-hook.sh
+    executable: true
+    purpose: Build, run, and configure an app automatically after Git push
+    content: |
+      #!/bin/bash
+      set -e
+      APP_NAME=$1; DOMAIN=$2; PORT=$3
+      [ -f /var/deploy-utils/.env ] && set -o allexport && source /var/deploy-utils/.env && set +o allexport
+      REPO_PATH="/var/repos/${APP_NAME}.git"
+      APP_PATH="/var/www/${APP_NAME}"
+      [ ! -d "$APP_PATH" ] && mkdir -p "$APP_PATH" && git clone "$REPO_PATH" "$APP_PATH"
+      cd "$APP_PATH"
+      git fetch origin && git reset --hard origin/main
+      npm ci --silent || npm install --silent
+      npm run build || true
+      pm2 start npm --name "$APP_NAME" -- run preview -- --port $PORT || pm2 restart "$APP_NAME"
+      pm2 save
+      CONF="/etc/nginx/sites-available/${APP_NAME}.conf"
+      cat <<EOF | sudo tee $CONF > /dev/null
+      server {
+          listen 80;
+          server_name $DOMAIN;
+          location / {
+              proxy_pass http://localhost:$PORT;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade \$http_upgrade;
+              proxy_set_header Connection 'upgrade';
+              proxy_set_header Host \$host;
+          }
+      }
+      EOF
+      ln -sf "$CONF" /etc/nginx/sites-enabled/
+      systemctl reload nginx
+      if [ "$USE_WILDCARD_SSL" != true ]; then
+        certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$CERTBOT_EMAIL" || true
+      fi
+      systemctl reload nginx
+      echo "✅ Deployed $APP_NAME at https://$DOMAIN"
+
+  # --------------------------------------------------------
+  # 6. List Apps Script
+  # --------------------------------------------------------
+  - path: /var/deploy-utils/list-apps.sh
+    executable: true
+    purpose: Show all deployed apps with domain and status
+    content: |
+      #!/bin/bash
+      set -e
+      [ -f /var/deploy-utils/.env ] && set -o allexport && source /var/deploy-utils/.env && set +o allexport
+      FILE="/var/deploy-utils/ports.json"
+      [ ! -f "$FILE" ] && echo "No apps deployed yet." && exit 0
+      echo "📋 Deployed apps:"
+      jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$FILE" | while read APP PORT; do
+        DOMAIN="${APP}.${BASE_DOMAIN}"
+        STATUS=$(pm2 describe "$APP" >/dev/null 2>&1 && echo "🟢" || echo "🔴")
+        printf "%-15s %-35s %-8s %-5s\n" "$APP" "$DOMAIN" "$PORT" "$STATUS"
+      done
+
+  # --------------------------------------------------------
+  # 7. Delete App Script
+  # --------------------------------------------------------
+  - path: /var/deploy-utils/delete-app.sh
+    executable: true
+    purpose: Remove app, Nginx config, PM2 process, and SSL cert
+    content: |
+      #!/bin/bash
+      set -e
+      APP_NAME=$1
+      [ -z "$APP_NAME" ] && echo "Usage: delete-app.sh <name>" && exit 1
+      [ -f /var/deploy-utils/.env ] && set -o allexport && source /var/deploy-utils/.env && set +o allexport
+      REPO="/var/repos/${APP_NAME}.git"
+      WWW="/var/www/${APP_NAME}"
+      CONF="/etc/nginx/sites-available/${APP_NAME}.conf"
+      pm2 stop "$APP_NAME" || true
+      pm2 delete "$APP_NAME" || true
+      rm -rf "$REPO" "$WWW"
+      rm -f "$CONF" "/etc/nginx/sites-enabled/${APP_NAME}.conf"
+      jq "del(.\"$APP_NAME\")" /var/deploy-utils/ports.json > tmp.$$.json && mv tmp.$$.json /var/deploy-utils/ports.json
+      systemctl reload nginx
+      echo "✅ Removed $APP_NAME"
+
+  # --------------------------------------------------------
+  # 8. Install Script (Server)
+  # --------------------------------------------------------
+  - path: install-server.sh
+    executable: true
+    purpose: Install VumaBrew on a new server
+    content: |
+      #!/bin/bash
+      set -e
+      REPO_URL="https://github.com/andrevermeulen/vuma-brew.git"
+      read -p "🌍 Enter base domain (e.g. apps.domain.com): " BASE_DOMAIN
+      read -p "📧 Admin email: " ADMIN_EMAIL
+      mkdir -p /var/deploy-utils
+      cat <<EOF > /var/deploy-utils/.env
+      BASE_DOMAIN="$BASE_DOMAIN"
+      ADMIN_EMAIL="$ADMIN_EMAIL"
+      USE_WILDCARD_SSL=true
+      CERTBOT_EMAIL="$ADMIN_EMAIL"
+      DEFAULT_NODE_PORT=4173
+      DEPLOY_USER="deploy"
+      DEPLOY_HOME="/home/deploy"
+      EOF
+      apt update && apt install -y git jq curl
+      git clone $REPO_URL /opt/vuma-brew || (cd /opt/vuma-brew && git pull)
+      cp /opt/vuma-brew/deploy-utils/*.sh /var/deploy-utils/
+      chmod +x /var/deploy-utils/*.sh
+      /var/deploy-utils/setup-server.sh
+      echo "✅ VumaBrew installed and configured at /var/deploy-utils"
+
+  # --------------------------------------------------------
+  # 9. Install Script (Client)
+  # --------------------------------------------------------
+  - path: install-client.sh
+    executable: true
+    purpose: Install the deploy CLI for developers
+    content: |
+      #!/bin/bash
+      set -e
+      echo "🚀 Installing VumaBrew CLI"
+      read -p "🔗 Enter server hostname/IP: " SERVER_HOST
+      read -p "👤 Enter SSH user (default: deploy): " SERVER_USER
+      SERVER_USER=${SERVER_USER:-deploy}
+      ENV_FILE="$HOME/.deploy.env"
+      cat <<EOF > "$ENV_FILE"
+      DEPLOY_SERVER_USER="$SERVER_USER"
+      DEPLOY_SERVER_HOST="$SERVER_HOST"
+      DEPLOY_SERVER="\$DEPLOY_SERVER_USER@\${DEPLOY_SERVER_HOST}"
+      DEPLOY_UTILS_PATH="/var/deploy-utils"
+      EOF
+      chmod 600 "$ENV_FILE"
+      mkdir -p "$HOME/bin"
+      cat <<'EOS' > "$HOME/bin/deploy"
+      #!/bin/bash
+      set -e
+      [ -f "$HOME/.deploy.env" ] && set -o allexport && source "$HOME/.deploy.env" && set +o allexport || (echo "⚠️ ~/.deploy.env missing"; exit 1)
+      CMD=$1; APP=$2
+      if [ "$CMD" == "new" ]; then
+        RESULT=$(ssh -o StrictHostKeyChecking=no "$DEPLOY_SERVER" "sudo -u $DEPLOY_SERVER_USER $DEPLOY_UTILS_PATH/create-app.sh $APP")
+        NAME=$(echo "$RESULT" | jq -r '.name'); DOMAIN=$(echo "$RESULT" | jq -r '.domain'); REPO=$(echo "$RESULT" | jq -r '.repo')
+        echo "✅ App $NAME → $DOMAIN"
+        git remote remove production 2>/dev/null
+        git remote add production "$DEPLOY_SERVER:$REPO"
+        echo "Push with: git push production main"
+        exit 0
+      fi
+      [ "$CMD" == "list" ] && ssh "$DEPLOY_SERVER" "sudo -u $DEPLOY_SERVER_USER $DEPLOY_UTILS_PATH/list-apps.sh" && exit 0
+      [ "$CMD" == "delete" ] && ssh "$DEPLOY_SERVER" "sudo -u $DEPLOY_SERVER_USER $DEPLOY_UTILS_PATH/delete-app.sh $APP" && exit 0
+      echo "Usage: deploy new [name] | deploy list | deploy delete <name>"
+      EOS
+      chmod +x "$HOME/bin/deploy"
+      [[ ":$PATH:" != *":$HOME/bin:"* ]] && echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+      echo "✅ VumaBrew CLI installed. Try: deploy new myapp"
