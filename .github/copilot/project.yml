@@ -66,8 +66,30 @@ files:
     content: |
       DEPLOY_SERVER_USER="deploy"
       DEPLOY_SERVER_HOST="your-server"
-      DEPLOY_SERVER="${DEPLOY_SERVER_USER}@${DEPLOY_SERVER_HOST}"
+      DEPLOY_SERVER="");
       DEPLOY_UTILS_PATH="/var/deploy-utils"
+
+  # --------------------------------------------------------
+  # 2.5 Example .env file (repository root)
+  # --------------------------------------------------------
+  - path: .env.example
+    purpose: Example environment variables for project and developer setup
+    content: |
+      # Example .env for VumaBrew (copy to .env and customize)
+      # Server-side configuration
+      BASE_DOMAIN=apps.example.com
+      ADMIN_EMAIL=admin@example.com
+      USE_WILDCARD_SSL=true
+      CERTBOT_EMAIL=admin@example.com
+      DEFAULT_NODE_PORT=4173
+      DEPLOY_USER=deploy
+      DEPLOY_HOME=/home/deploy
+
+      # Client-side / Developer configuration
+      DEPLOY_SERVER_USER=deploy
+      DEPLOY_SERVER_HOST=your-server
+      DEPLOY_SERVER=${DEPLOY_SERVER_USER}@${DEPLOY_SERVER_HOST}
+      DEPLOY_UTILS_PATH=/var/deploy-utils
 
   # --------------------------------------------------------
   # 3. Server Setup Script
@@ -185,7 +207,7 @@ files:
       jq -r 'to_entries[] | "\(.key)\t\(.value)"' "$FILE" | while read APP PORT; do
         DOMAIN="${APP}.${BASE_DOMAIN}"
         STATUS=$(pm2 describe "$APP" >/dev/null 2>&1 && echo "🟢" || echo "🔴")
-        printf "%-15s %-35s %-8s %-5s\n" "$APP" "$DOMAIN" "$PORT" "$STATUS"
+        printf "% -15s %-35s %-8s %-5s\n" "$APP" "$DOMAIN" "$PORT" "$STATUS"
       done
 
   # --------------------------------------------------------
@@ -225,10 +247,10 @@ files:
       read -p "📧 Admin email: " ADMIN_EMAIL
       mkdir -p /var/deploy-utils
       cat <<EOF > /var/deploy-utils/.env
-      BASE_DOMAIN="$BASE_DOMAIN"
-      ADMIN_EMAIL="$ADMIN_EMAIL"
+      BASE_DOMAIN="${BASE_DOMAIN}"
+      ADMIN_EMAIL="${ADMIN_EMAIL}"
       USE_WILDCARD_SSL=true
-      CERTBOT_EMAIL="$ADMIN_EMAIL"
+      CERTBOT_EMAIL="${ADMIN_EMAIL}"
       DEFAULT_NODE_PORT=4173
       DEPLOY_USER="deploy"
       DEPLOY_HOME="/home/deploy"
