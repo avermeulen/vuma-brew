@@ -1,0 +1,14 @@
+# Node
+node_modules/
+npm-debug.log*
+.env
+*.log
+
+# PM2 / build artifacts
+dist/
+tmp/
+*.pid
+
+# System
+.DS_Store
+.idea/
